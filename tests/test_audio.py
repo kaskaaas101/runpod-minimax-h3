@@ -3,8 +3,9 @@ duration choice, and the R2VA graph wiring. Runs without ComfyUI or RunPod:
 
     python -m unittest discover -s tests
 
-R2VA_JSON=<path to MiniMaxH3-Singularity-R2VA.json from ForgeHub> also runs the
-real workflow through _patch.
+R2VA_JSON / I2VA_JSON / FL2VA_JSON=<path to MiniMaxH3-Singularity-R2VA.json /
+MiniMaxH3-Turbo-I2VA.json / MiniMaxH3-Turbo-FL2VA.json from ForgeHub> also run the
+real workflows through _patch.
 """
 import base64
 import copy
@@ -53,6 +54,21 @@ R2VA = {
     "23": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["14", 0], "vae": ["24", 0]}},
     "91": {"class_type": "CreateVideo", "inputs": {"fps": 24, "audio": ["23", 0]}},
     "126": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": 48, "audio": ["23", 0], "save_output": True}},
+}
+
+
+# I2VA's wiring (ForgeHub's MiniMaxH3-Turbo-I2VA.json): MiniMaxH3ImageToVideo takes the photo as
+# its first frame and has no audio_vae input; the sound is decoded with the audio VAE "24".
+I2VA = {
+    "111": {"class_type": "PrimitiveFloat", "inputs": {"value": 5}},
+    "11": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+    "24": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+    "256": {"class_type": "PixaromaLoadImageMini", "inputs": {"image": "template.jpg"}},
+    "104": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"prompt": "x", "vae": ["11", 0], "first_frame": ["256", 0]}},
+    "16": {"class_type": "BasicGuider", "inputs": {"conditioning": ["104", 0]}},
+    "14": {"class_type": "SamplerCustomAdvanced", "inputs": {"guider": ["16", 0], "latent_image": ["104", 1]}},
+    "23": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["14", 0], "vae": ["24", 0]}},
+    "126": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": 48, "audio": ["23", 0]}},
 }
 
 
@@ -123,13 +139,32 @@ class Wiring(unittest.TestCase):
         self.assertEqual(g["16"]["inputs"]["conditioning"], ["224", 0])
         self.assertEqual(g["126"]["inputs"]["audio"], ["23", 0])
 
+    def test_image_to_video(self):
+        """I2VA / FL2VA: the guide follows MiniMaxH3ImageToVideo, with the graph's decoding audio VAE."""
+        g = copy.deepcopy(I2VA)
+        load = handler._inject_audio(g, "j_audio.mp3")
+        guide = next(k for k, n in g.items() if n["class_type"] == "MiniMaxH3AddGuide")
+        self.assertEqual(g[guide]["inputs"], {"positive": ["104", 0], "latent": ["104", 1], "audio_vae": ["24", 0], "audio": [load, 0], "frame_idx": 0})
+        self.assertEqual(g["16"]["inputs"]["conditioning"], [guide, 0])
+        self.assertEqual(g["14"]["inputs"]["latent_image"], ["104", 1])
+        self.assertEqual(g["104"]["inputs"]["first_frame"], ["256", 0])  # the photo stays the first frame
+        self.assertEqual(g["126"]["inputs"]["audio"], [load, 0])
+
     def test_refusals(self):
-        with self.assertRaisesRegex(ValueError, "R2VA workflow"):
-            handler._inject_audio({"1": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {}}}, "a.wav")
+        with self.assertRaisesRegex(ValueError, "R2VA, I2VA or FL2VA workflow"):
+            handler._inject_audio({"1": {"class_type": "MiniMaxH3DirectorCS", "inputs": {}}}, "a.wav")
+        with self.assertRaisesRegex(ValueError, "reference audio needs an R2VA workflow"):
+            handler._inject_audio(copy.deepcopy(I2VA), "a.wav", "reference")
+        g = copy.deepcopy(I2VA)
+        del g["23"]
+        del g["126"]["inputs"]["audio"]
+        with self.assertRaisesRegex(ValueError, "audio VAE"):
+            handler._inject_audio(g, "a.wav")
+        # (R2VA without its audio_vae input: the decoder's VAE)
         g = copy.deepcopy(R2VA)
         del g["224"]["inputs"]["audio_vae"]
-        with self.assertRaisesRegex(ValueError, "audio_vae"):
-            handler._inject_audio(g, "a.wav")
+        handler._inject_audio(g, "a.wav")
+        self.assertEqual(next(n for n in g.values() if n["class_type"] == "MiniMaxH3AddGuide")["inputs"]["audio_vae"], ["24", 0])
 
 
 class Patch(unittest.TestCase):
@@ -192,6 +227,47 @@ class Patch(unittest.TestCase):
             for i, v in n["inputs"].items():
                 if isinstance(v, list) and len(v) == 2 and isinstance(v[1], int):
                     self.assertIn(str(v[0]), g, f"{k}.{i} -> {v}")
+
+
+class RealImageToVideo(unittest.TestCase):
+    """ForgeHub's I2VA and FL2VA through the whole _patch, uploads stubbed."""
+
+    def setUp(self):
+        self._upload = handler._upload
+        handler._upload = lambda name, data: name
+
+    def tearDown(self):
+        handler._upload = self._upload
+
+    def check(self, path, pics):
+        wf = json.loads(Path(path).read_text(encoding="utf-8"))
+        g = handler._patch(wf, {"prompt": "<Picture 1> sings", "audio": b64(wav(7.0)), "images": [b64(b"jpg")] * pics,
+                                "job_name": "t", "enhance": False, "config": "hybrid_fl2va_r2va_turbo",
+                                "video_size": "768x1344", "upscale": False, "rife": False})
+        gen = next(k for k, n in g.items() if n["class_type"] == "MiniMaxH3ImageToVideo")
+        guide = next(k for k, n in g.items() if n["class_type"] == "MiniMaxH3AddGuide")
+        load = next(k for k, n in g.items() if n["class_type"] == "LoadAudio")
+        decoder = next(n for n in g.values() if n["class_type"] == "VAEDecodeAudio")
+        self.assertEqual(g[guide]["inputs"]["audio_vae"], decoder["inputs"]["vae"])
+        users = [(k, i) for k, n in g.items() for i, v in n["inputs"].items() if v == [gen, 0]]
+        self.assertEqual(users, [(guide, "positive")])
+        self.assertEqual(next(n for n in g.values() if n["class_type"] == "VHS_VideoCombine")["inputs"]["audio"], [load, 0])
+        self.assertAlmostEqual(next(n for n in g.values() if n["class_type"] == "PrimitiveFloat")["inputs"]["value"], 7.0)
+        qwen = next(n for n in g.values() if n["class_type"].startswith("QwenVL"))
+        self.assertTrue(qwen["inputs"]["passthrough"])
+        self.assertIsInstance(g[gen]["inputs"].get("first_frame"), list)
+        for k, n in g.items():
+            for i, v in n["inputs"].items():
+                if isinstance(v, list) and len(v) == 2 and isinstance(v[1], int):
+                    self.assertIn(str(v[0]), g, f"{k}.{i} -> {v}")
+
+    @unittest.skipUnless(os.environ.get("I2VA_JSON"), "I2VA_JSON not set")
+    def test_forgehub_i2va(self):
+        self.check(os.environ["I2VA_JSON"], 1)
+
+    @unittest.skipUnless(os.environ.get("FL2VA_JSON"), "FL2VA_JSON not set")
+    def test_forgehub_fl2va(self):
+        self.check(os.environ["FL2VA_JSON"], 2)
 
 
 if __name__ == "__main__":

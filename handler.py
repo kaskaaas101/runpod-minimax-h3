@@ -13,10 +13,11 @@ Job input:
     "seconds":  6,                                 # optional duration override
     "images":   ["https://... or base64"],         # optional, fills LoadImage nodes in id order
     "video":    "https://... or base64",           # optional, fills VHS_LoadVideo
-    "audio":    "https://... or base64",           # optional, 2-15 s (wav/mp3/flac/ogg/m4a), R2VA only
+    "audio":    "https://... or base64",           # optional, 2-15 s (wav/mp3/flac/ogg/m4a): R2VA, I2VA, FL2VA
     "audio_mode": "lipsync|reference",             # lipsync (default): anchored in the video's
-                                                   #   soundtrack (MiniMaxH3AddGuide); reference:
-                                                   #   <Audio 1> for the prompt (ref_audios)
+                                                   #   soundtrack (MiniMaxH3AddGuide; with I2VA /
+                                                   #   FL2VA the photo is the exact first frame);
+                                                   #   reference (R2VA): <Audio 1> (ref_audios)
     "audio_start_frame": 0,                        # lipsync: the frame the audio starts at
     "keep_audio": true                             # lipsync from frame 0: the saved video carries
                                                    #   the sent audio itself, not the decoded one
@@ -294,41 +295,55 @@ def _free_id(prompt, stem):
     return nid
 
 
+# The MiniMax H3 nodes that make the conditioning + AV latent an audio guide can follow:
+# R2VA's references, and I2VA / FL2VA's first (and last) frame, which they keep as frame keyframes
+# ("minimax_keyframes") that MiniMaxH3AddGuide adds the audio to.
+AUDIO_GENERATORS = ("MiniMaxH3ReferenceToVideo", "MiniMaxH3ImageToVideo")
+
+
 def _inject_audio(prompt, audio_name, mode="lipsync", start_frame=0, keep=True):
-    """Adds the job's audio to an R2VA graph (MiniMaxH3ReferenceToVideo):
-    a LoadAudio node, then
-    - lipsync: a MiniMaxH3AddGuide anchoring it at `start_frame` of the target
-      soundtrack (the R2VA conditioning's consumers take the guide's instead);
+    """Adds the job's audio to a MiniMax H3 graph: a LoadAudio node, then
+    - lipsync (R2VA, I2VA, FL2VA): a MiniMaxH3AddGuide anchoring it at
+      `start_frame` of the target soundtrack (the generator's conditioning
+      consumers take the guide's instead). The audio VAE is the generator's
+      `audio_vae` input (R2VA), else the one the graph decodes its sound with
+      (VAEDecodeAudio's `vae`: I2VA / FL2VA have no audio_vae input).
       `keep` (from frame 0 only): the savers' audio is the LoadAudio itself,
       not the decoded track;
-    - reference: the R2VA node's next free ref_audios slot (<Audio j> in the prompt).
+    - reference (R2VA only): the R2VA node's next free ref_audios slot
+      (<Audio j> in the prompt).
     Returns the LoadAudio node's id."""
-    r2v = [nid for nid, n in prompt.items() if n.get("class_type") == "MiniMaxH3ReferenceToVideo"]
-    if not r2v:
-        raise ValueError("audio needs an R2VA workflow (one with a MiniMaxH3ReferenceToVideo node)")
     if mode not in ("lipsync", "reference"):
         raise ValueError(f"audio_mode must be lipsync or reference, not {mode!r}")
+    kinds = ("MiniMaxH3ReferenceToVideo",) if mode == "reference" else AUDIO_GENERATORS
+    gens = [nid for nid, n in prompt.items() if n.get("class_type") in kinds]
+    if not gens:
+        if mode == "reference":
+            raise ValueError("reference audio needs an R2VA workflow (one with a MiniMaxH3ReferenceToVideo node)")
+        raise ValueError("audio needs an R2VA, I2VA or FL2VA workflow (a MiniMaxH3ReferenceToVideo or MiniMaxH3ImageToVideo node)")
+    decoded_with = next((n["inputs"]["vae"] for n in prompt.values()
+                         if n.get("class_type") == "VAEDecodeAudio" and isinstance(n.get("inputs", {}).get("vae"), list)), None)
     load = _free_id(prompt, "job_audio")
     prompt[load] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}, "_meta": {"title": "Job audio"}}
-    for rid in r2v:
-        rinp = prompt[rid].setdefault("inputs", {})
+    for gid in gens:
+        ginp = prompt[gid].setdefault("inputs", {})
         if mode == "reference":
-            used = {k for k in rinp if k.startswith("ref_audios.ref_audio_")}
+            used = {k for k in ginp if k.startswith("ref_audios.ref_audio_")}
             slot = next(i for i in range(len(used) + 1) if f"ref_audios.ref_audio_{i}" not in used)
             if slot > 2:
                 raise ValueError("the R2VA node takes 3 reference audios at most")
-            rinp[f"ref_audios.ref_audio_{slot}"] = [load, 0]
+            ginp[f"ref_audios.ref_audio_{slot}"] = [load, 0]
             continue
-        audio_vae = rinp.get("audio_vae")
+        audio_vae = ginp.get("audio_vae") if isinstance(ginp.get("audio_vae"), list) else decoded_with
         if not isinstance(audio_vae, list):
-            raise ValueError("lip-sync audio needs the R2VA node's audio_vae input")
+            raise ValueError("lip-sync audio needs the audio VAE (the generator's audio_vae input, or a VAEDecodeAudio's vae)")
         consumers = [(nid, k) for nid, n in prompt.items() for k, v in n.get("inputs", {}).items()
-                     if isinstance(v, list) and len(v) == 2 and str(v[0]) == str(rid) and v[1] == 0]
+                     if isinstance(v, list) and len(v) == 2 and str(v[0]) == str(gid) and v[1] == 0]
         if not consumers:
-            raise ValueError("nothing in the workflow uses the R2VA conditioning")
+            raise ValueError("nothing in the workflow uses the generator's conditioning")
         guide = _free_id(prompt, "job_audio_guide")
         prompt[guide] = {"class_type": "MiniMaxH3AddGuide", "_meta": {"title": "Job audio (lip-sync)"}, "inputs": {
-            "positive": [rid, 0], "latent": [rid, 1], "audio_vae": audio_vae,
+            "positive": [gid, 0], "latent": [gid, 1], "audio_vae": audio_vae,
             "audio": [load, 0], "frame_idx": int(start_frame)}}
         for nid, k in consumers:
             prompt[nid]["inputs"][k] = [guide, 0]
