@@ -12,19 +12,31 @@ Job input:
     "camera_tag": "[ORBIT]",                       # optional
     "seconds":  6,                                 # optional duration override
     "images":   ["https://... or base64"],         # optional, fills LoadImage nodes in id order
-    "video":    "https://... or base64"            # optional, fills VHS_LoadVideo
+    "video":    "https://... or base64",           # optional, fills VHS_LoadVideo
+    "audio":    "https://... or base64",           # optional, 2-15 s (wav/mp3/flac/ogg/m4a), R2VA only
+    "audio_mode": "lipsync|reference",             # lipsync (default): anchored in the video's
+                                                   #   soundtrack (MiniMaxH3AddGuide); reference:
+                                                   #   <Audio 1> for the prompt (ref_audios)
+    "audio_start_frame": 0,                        # lipsync: the frame the audio starts at
+    "keep_audio": true                             # lipsync from frame 0: the saved video carries
+                                                   #   the sent audio itself, not the decoded one
   }
+
+With "audio" and no "seconds", the video lasts as long as the audio.
 """
 
 import asyncio
 import base64
 import glob
+import io
 import json
+import math
 import os
 import random
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -59,6 +71,12 @@ S3_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "outputs")
 # (e.g. running handler.py directly without the entrypoint).
 PREP_DONE = os.environ.get("PREP_DONE", "/tmp/comfy-prep.done")
 PREP_TIMEOUT_S = int(os.environ.get("COMFY_PREP_TIMEOUT_S", "900"))
+
+# Job audio (R2VA): its length limits, and the QwenVL enhancer's "duration"
+# choices (DURATION_OPTIONS in ComfyUI-QwenVL-Mod; any other value fails validation).
+AUDIO_MIN_S = float(os.environ.get("AUDIO_MIN_S", "2"))
+AUDIO_MAX_S = float(os.environ.get("AUDIO_MAX_S", "15"))
+QWEN_DURATIONS = (5, 10, 15, 20)
 
 # Config → unet filename needle + sampler values (mirrors chat_service.py _MINIMAX_CONFIGS)
 MINIMAX_CONFIGS = {
@@ -181,7 +199,163 @@ async def _ensure_comfy():
 def _media_bytes(value):
     if isinstance(value, str) and value.startswith("http"):
         return urllib.request.urlopen(value, timeout=120).read()
+    if isinstance(value, str) and value.startswith("data:"):
+        value = value.split(",", 1)[-1]
     return base64.b64decode(value)
+
+
+def _audio_ext(raw):
+    """The audio's format from its first bytes."""
+    h = raw[:16]
+    if h[:4] == b"RIFF" and h[8:12] == b"WAVE":
+        return "wav"
+    if h[:4] == b"fLaC":
+        return "flac"
+    if h[:4] == b"OggS":
+        return "ogg"
+    if h[:3] == b"ID3" or (len(h) > 1 and h[0] == 0xFF and (h[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if h[4:8] == b"ftyp":
+        return "m4a"
+    raise ValueError("audio: unknown format (send wav, mp3, flac, ogg or m4a)")
+
+
+def _audio_seconds(raw, ext):
+    """The audio's length: wav from its header, else PyAV (ComfyUI's own audio
+    reader), else ffprobe."""
+    if ext == "wav":
+        import wave
+        try:
+            with wave.open(io.BytesIO(raw)) as w:
+                return w.getnframes() / float(w.getframerate())
+        except Exception:
+            pass  # (float or extensible wav: the readers below)
+    try:
+        import av
+        with av.open(io.BytesIO(raw)) as c:
+            stream = next((st for st in c.streams if st.type == "audio"), None)
+            if stream is None:
+                raise ValueError("audio: the file has no audio stream")
+            if stream.duration and stream.time_base:
+                return float(stream.duration * stream.time_base)
+            if c.duration:
+                return c.duration / 1_000_000
+            samples, rate = 0, 0
+            for frame in c.decode(stream):
+                samples, rate = samples + frame.samples, frame.sample_rate
+            if rate:
+                return samples / rate
+    except ImportError:
+        pass
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
+        f.write(raw)
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", f.name], capture_output=True, text=True, timeout=60)
+        return float(out.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"audio: couldn't read its length ({exc})") from exc
+    finally:
+        os.unlink(f.name)
+
+
+def _prepare_audio(job):
+    """The job's audio as (bytes, extension, seconds), checked; None without one.
+    Kept on the job, so the handler can check it before waiting for ComfyUI and
+    _patch doesn't fetch it again."""
+    if not job.get("audio"):
+        return None
+    if "_audio" not in job:
+        mode = job.get("audio_mode") or "lipsync"
+        if mode not in ("lipsync", "reference"):
+            raise ValueError(f"audio_mode must be lipsync or reference, not {mode!r}")
+        try:
+            raw = _media_bytes(job["audio"])
+        except Exception as exc:
+            raise ValueError(f"audio: neither a link nor base64 ({exc})") from exc
+        ext = _audio_ext(raw)
+        secs = _audio_seconds(raw, ext)
+        if not AUDIO_MIN_S <= secs <= AUDIO_MAX_S:
+            raise ValueError(f"audio is {secs:.2f} s long: it must be {AUDIO_MIN_S:g}-{AUDIO_MAX_S:g} s")
+        job["_audio"] = (raw, ext, secs)
+    return job["_audio"]
+
+
+def _qwen_duration(secs):
+    """The QwenVL enhancer's duration choice for a clip of `secs`: the shortest one that holds it."""
+    whole = math.ceil(secs)
+    return f"{next((d for d in QWEN_DURATIONS if d >= whole), QWEN_DURATIONS[-1])}s"
+
+
+def _free_id(prompt, stem):
+    nid, k = stem, 2
+    while nid in prompt:
+        nid, k = f"{stem}_{k}", k + 1
+    return nid
+
+
+def _inject_audio(prompt, audio_name, mode="lipsync", start_frame=0, keep=True):
+    """Adds the job's audio to an R2VA graph (MiniMaxH3ReferenceToVideo):
+    a LoadAudio node, then
+    - lipsync: a MiniMaxH3AddGuide anchoring it at `start_frame` of the target
+      soundtrack (the R2VA conditioning's consumers take the guide's instead);
+      `keep` (from frame 0 only): the savers' audio is the LoadAudio itself,
+      not the decoded track;
+    - reference: the R2VA node's next free ref_audios slot (<Audio j> in the prompt).
+    Returns the LoadAudio node's id."""
+    r2v = [nid for nid, n in prompt.items() if n.get("class_type") == "MiniMaxH3ReferenceToVideo"]
+    if not r2v:
+        raise ValueError("audio needs an R2VA workflow (one with a MiniMaxH3ReferenceToVideo node)")
+    if mode not in ("lipsync", "reference"):
+        raise ValueError(f"audio_mode must be lipsync or reference, not {mode!r}")
+    load = _free_id(prompt, "job_audio")
+    prompt[load] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}, "_meta": {"title": "Job audio"}}
+    for rid in r2v:
+        rinp = prompt[rid].setdefault("inputs", {})
+        if mode == "reference":
+            used = {k for k in rinp if k.startswith("ref_audios.ref_audio_")}
+            slot = next(i for i in range(len(used) + 1) if f"ref_audios.ref_audio_{i}" not in used)
+            if slot > 2:
+                raise ValueError("the R2VA node takes 3 reference audios at most")
+            rinp[f"ref_audios.ref_audio_{slot}"] = [load, 0]
+            continue
+        audio_vae = rinp.get("audio_vae")
+        if not isinstance(audio_vae, list):
+            raise ValueError("lip-sync audio needs the R2VA node's audio_vae input")
+        consumers = [(nid, k) for nid, n in prompt.items() for k, v in n.get("inputs", {}).items()
+                     if isinstance(v, list) and len(v) == 2 and str(v[0]) == str(rid) and v[1] == 0]
+        if not consumers:
+            raise ValueError("nothing in the workflow uses the R2VA conditioning")
+        guide = _free_id(prompt, "job_audio_guide")
+        prompt[guide] = {"class_type": "MiniMaxH3AddGuide", "_meta": {"title": "Job audio (lip-sync)"}, "inputs": {
+            "positive": [rid, 0], "latent": [rid, 1], "audio_vae": audio_vae,
+            "audio": [load, 0], "frame_idx": int(start_frame)}}
+        for nid, k in consumers:
+            prompt[nid]["inputs"][k] = [guide, 0]
+    if mode == "lipsync" and keep and int(start_frame) == 0:
+        decoders = {nid for nid, n in prompt.items() if n.get("class_type") == "VAEDecodeAudio"}
+        for n in prompt.values():
+            v = n.get("inputs", {}).get("audio")
+            if isinstance(v, list) and v and str(v[0]) in decoders:
+                n["inputs"]["audio"] = [load, 0]
+    return load
+
+
+def _audio_support():
+    """Whether this ComfyUI has the audio inputs the `audio` field uses (its
+    /object_info), for the health action; None while ComfyUI isn't up."""
+    if not _BOOT_DONE.is_set() or _BOOT_ERR is not None:
+        return None
+    out = {}
+    for key, node, needle in (("load_audio", "LoadAudio", None),
+                              ("lipsync", "MiniMaxH3AddGuide", '"audio"'),
+                              ("reference", "MiniMaxH3ReferenceToVideo", "ref_audios")):
+        try:
+            info = json.loads(_http(f"/object_info/{node}", timeout=10)).get(node)
+            out[key] = bool(info) and (needle is None or needle in json.dumps(info.get("input", {})))
+        except Exception:
+            out[key] = False
+    return out
 
 
 def _upload(filename, data):
@@ -351,6 +525,10 @@ def _patch(prompt, job):
     video_name = None
     if job.get("video"):
         video_name = _upload(f"{base}.mp4", _media_bytes(job["video"]))
+    audio = _prepare_audio(job)
+    audio_name = _upload(f"{base}_audio.{audio[1]}", audio[0]) if audio else None
+    # the length: `seconds`, else the audio's (exact: the graph snaps it up to the 17k+5 frame grid)
+    seconds = float(int(job["seconds"])) if job.get("seconds") else (audio[2] if audio else None)
 
     def _find_file(kind, needle):
         """Locate a model file under the volume + local model dirs."""
@@ -423,14 +601,15 @@ def _patch(prompt, job):
         if director_nodes and director_tdata is None and ct == "StringConcatenate" \
                 and "string_a" in inp and not isinstance(inp["string_a"], list):
             inp["string_a"] = _job_style_text(job)
-        if director_tdata is None and job.get("seconds"):
-            sec = int(job["seconds"])
+        if director_tdata is None and seconds:
             if "duration" in inp:
-                inp["duration"] = f"{sec}s"
+                # the QwenVL enhancer's choice ("5s" / "10s" / "15s" / "20s")
+                inp["duration"] = _qwen_duration(seconds)
             elif "length" in inp and not isinstance(inp["length"], list):
-                inp["length"] = sec * 24
-            elif "value" in inp and ct.startswith("Primitive"):
-                inp["value"] = sec
+                inp["length"] = math.ceil(seconds * 24)
+            elif "value" in inp and ct in ("PrimitiveFloat", "PrimitiveInt"):
+                # (number primitives only: the Image workflows' prompt is a PrimitiveStringMultiline)
+                inp["value"] = seconds if ct == "PrimitiveFloat" else math.ceil(seconds)
         if "lora_name" in inp:
             cur_lora = str(inp.get("lora_name", "")).lower()
             if "realism" in cur_lora or "character_swap" in cur_lora:
@@ -540,6 +719,9 @@ def _patch(prompt, job):
                 for k, v in n.get("inputs", {}).items():
                     if isinstance(v, list) and v and v[0] == drop_lora:
                         n["inputs"][k] = src
+    if audio_name:
+        _inject_audio(prompt, audio_name, job.get("audio_mode") or "lipsync",
+                      job.get("audio_start_frame") or 0, job.get("keep_audio", True))
     # Post-processing toggles: the graph chain is  save.images <- rife.frames
     # <- upscale.images <- VAEDecode.  upscale=false rewires rife.frames to the
     # decoder output; rife=false rewires save.images to rife's own source.
@@ -860,7 +1042,11 @@ async def handler(job):
             "comfyui_error": str(_BOOT_ERR) if _BOOT_ERR else None,
             "workflows": sorted({p.name for d in (WF_SYNC_DIR, WORKFLOWS_DIR) for p in d.glob("*.json")}),
             "volume_mounted": os.path.isdir("/runpod-volume"),
+            # the `audio` field's nodes in this ComfyUI (null while it boots)
+            "audio_support": await asyncio.to_thread(_audio_support),
         }
+    # A bad audio fails now, not after waiting minutes for a cold ComfyUI boot.
+    await asyncio.to_thread(_prepare_audio, inputs)
     # Any real workload needs ComfyUI — wait for the background boot first.
     await _ensure_comfy()
     _prune_volume_outputs()
